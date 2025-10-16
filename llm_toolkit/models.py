@@ -513,6 +513,164 @@ class ChatGPT4Turbo(ChatGPT):
   name = 'chatgpt-4-turbo'
 
 
+class OpenAICompatModel(GPT):
+  """OpenAI-compatible provider model base.
+
+  This subclass reuses the GPT(OpenAI) flow but allows custom base_url and
+  api_key for providers that expose an OpenAI-compatible API surface.
+
+  Subclasses should set:
+    - provider_name: a friendly identifier used in CLI/model listing.
+    - _remote_model: the remote model identifier on the provider.
+    - _default_base_url: provider default base URL.
+
+  Environment variables used (names can be overridden by subclasses if
+  needed by overriding _get_api_key/_get_base_url/_get_remote_model):
+    - OPENAI_API_KEY (fallback)
+    - <PROVIDER>_API_KEY (preferred)
+    - <PROVIDER>_BASE_URL (preferred)
+    - <PROVIDER>_MODEL (optional override of _remote_model)
+  """
+
+  # Friendly name for CLI; subclasses must override.
+  provider_name: str = 'openai_compat_provider'
+  # Remote model id to pass to the provider; subclasses must override.
+  _remote_model: str = ''
+  # Default base URL for the provider; subclasses must override.
+  _default_base_url: str = ''
+
+  # By default, reuse OpenAI Prompt format
+  def prompt_type(self) -> type[prompts.Prompt]:  # type: ignore[override]
+    return prompts.OpenAIPrompt
+
+  # Helpers to read environment variables with provider-specific prefixes.
+  def _provider_env_prefix(self) -> str:
+    return self.provider_name.upper().replace('-', '_')
+
+  def _get_api_key(self) -> Optional[str]:
+    prefix = self._provider_env_prefix()
+    # Prefer <PROVIDER>_API_KEY, fallback to OPENAI_API_KEY
+    return os.getenv(f'{prefix}_API_KEY') or os.getenv('OPENAI_API_KEY')
+
+  def _get_base_url(self) -> str:
+    prefix = self._provider_env_prefix()
+    return os.getenv(f'{prefix}_BASE_URL', self._default_base_url)
+
+  def _get_remote_model(self) -> str:
+    prefix = self._provider_env_prefix()
+    return os.getenv(f'{prefix}_MODEL', self._remote_model)
+
+  def _get_client(self):  # type: ignore[override]
+    """Returns the OpenAI-compatible client with custom base URL."""
+    api_key = self._get_api_key()
+    base_url = self._get_base_url()
+    if not api_key:
+      logger.warning('%s API key not set. Set %s_API_KEY or OPENAI_API_KEY.',
+                     self.provider_name, self._provider_env_prefix())
+    return openai.OpenAI(api_key=api_key, base_url=base_url)
+
+  # Override to pass the remote model id rather than the friendly class name.
+  def chat_llm(self, client: Any, prompt: prompts.Prompt) -> str:  # type: ignore[override]
+    if self.ai_binary:
+      raise ValueError(
+          f'{self.provider_name} does not use local AI binary: {self.ai_binary}')
+    if self.temperature_list:
+      logger.info('%s does not allow temperature list: %s',
+                  self.provider_name, self.temperature_list)
+
+    self.messages.extend(prompt.get())
+
+    model_id = self._get_remote_model()
+    completion = self.with_retry_on_error(
+        lambda: client.chat.completions.create(messages=self.messages,
+                                               model=model_id,
+                                               n=self.num_samples,
+                                               temperature=self.temperature),
+        [openai.OpenAIError])
+
+    llm_response = completion.choices[0].message.content
+    self.messages.append({'role': 'assistant', 'content': llm_response})
+    return llm_response
+
+  def ask_llm(self, prompt: prompts.Prompt) -> str:  # type: ignore[override]
+    if self.ai_binary:
+      raise ValueError(
+          f'{self.provider_name} does not use local AI binary: {self.ai_binary}')
+    if self.temperature_list:
+      logger.info('%s does not allow temperature list: %s',
+                  self.provider_name, self.temperature_list)
+
+    client = self._get_client()
+    model_id = self._get_remote_model()
+    completion = self.with_retry_on_error(
+        lambda: client.chat.completions.create(messages=prompt.get(),
+                                               model=model_id,
+                                               n=self.num_samples,
+                                               temperature=self.temperature),
+        [openai.OpenAIError])
+    return completion.choices[0].message.content
+
+  def query_llm(self, prompt: prompts.Prompt, response_dir: str) -> None:  # type: ignore[override]
+    if self.ai_binary:
+      raise ValueError(
+          f'{self.provider_name} does not use local AI binary: {self.ai_binary}')
+    if self.temperature_list:
+      logger.info('%s does not allow temperature list: %s',
+                  self.provider_name, self.temperature_list)
+
+    client = self._get_client()
+    model_id = self._get_remote_model()
+    completion = self.with_retry_on_error(
+        lambda: client.chat.completions.create(messages=prompt.get(),
+                                               model=model_id,
+                                               n=self.num_samples,
+                                               temperature=self.temperature),
+        [openai.OpenAIError])
+    for index, choice in enumerate(completion.choices):  # type: ignore
+      content = choice.message.content
+      self._save_output(index, content, response_dir)
+
+  def chat_llm_with_tools(self, client: Any, prompt: Optional[prompts.Prompt],
+                          tools) -> Any:  # type: ignore[override]
+    """Queries the LLM in the given chat session with tools using Responses API."""
+    if self.ai_binary:
+      raise ValueError(
+          f'{self.provider_name} does not use local AI binary: {self.ai_binary}')
+    if self.temperature_list:
+      logger.info('%s does not allow temperature list: %s',
+                  self.provider_name, self.temperature_list)
+
+    if prompt:
+      self.messages.extend(prompt.get())
+
+    model_id = self._get_remote_model()
+    result = self.with_retry_on_error(
+        lambda: client.responses.create(model=model_id,
+                                        input=self.messages,
+                                        tools=tools), [openai.OpenAIError])
+    return result
+
+
+class SiliconFlowDeepSeekV3(OpenAICompatModel):
+  """SiliconFlow provider: DeepSeek V3 model.
+
+  Usage:
+    - Export environment variables (recommended):
+        SILICONFLOW_API_KEY=...  # or OPENAI_API_KEY
+        SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1  # default
+        SILICONFLOW_MODEL=deepseek-ai/DeepSeek-V3             # default
+    - Select with CLI flag: --model siliconflow_deepseek-v3
+  """
+
+  # CLI-visible friendly name
+  name = 'siliconflow_deepseek-v3'
+
+  # Provider identity
+  provider_name = 'siliconflow'
+  _default_base_url = 'https://api.siliconflow.cn/v1'
+  _remote_model = 'deepseek-ai/DeepSeek-V3'
+
+
 class AzureGPT(GPT):
   """Azure's GPT model."""
 
